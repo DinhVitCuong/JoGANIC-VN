@@ -55,6 +55,87 @@ from torchvision.models import resnet152, ResNet152_Weights
 from torchvision.transforms import Compose, Normalize, ToTensor
 from ultralytics import YOLO
 
+class NamedEntityEmbedder(nn.Module):
+    """Embeds named entities using pre-trained Wikipedia2Vec vectors."""
+    def __init__(self, embedding_path: str):
+        super().__init__()
+        from gensim.models import KeyedVectors
+        self.kv = KeyedVectors.load(embedding_path, mmap='r')
+        self.dim = self.kv.vector_size
+
+    def forward(self, entities):
+        vecs = []
+        for e in entities:
+            if e in self.kv:
+                vecs.append(torch.tensor(self.kv[e], dtype=torch.float))
+        if not vecs:
+            return torch.zeros((0, self.dim))
+        return torch.stack(vecs, dim=0)
+
+
+def mstr_embed(text: str, tokenizer, model, segmenter, device: torch.device,
+               span: int = 512, stride: int = 256) -> List[float]:
+    """Multi-Span Text Reading to embed long articles."""
+    seg_text = ' '.join(segmenter.word_segment(text))
+    tokens = tokenizer.encode(seg_text, add_special_tokens=False)
+    spans = []
+    start = 0
+    while start < len(tokens):
+        end = min(start + span, len(tokens))
+        segment = tokens[start:end]
+        batch = tokenizer.prepare_for_model(segment, return_tensors='pt')
+        batch = {k: v.to(device) for k, v in batch.items()}
+        with torch.no_grad():
+            out = model(**batch).last_hidden_state.mean(dim=1).squeeze(0)
+        spans.append(out)
+        if end == len(tokens):
+            break
+        start += stride
+    if not spans:
+        return [0.0] * model.config.hidden_size
+    stacked = torch.stack(spans, dim=0)
+    return stacked.mean(dim=0).cpu().tolist()
+
+
+class JoGANICEncoder(nn.Module):
+    """Encoder producing image, text and named entity features."""
+    def __init__(self, device: torch.device, vncorenlp_path="/data/npl/ICEK/VnCoreNLP",
+                 wiki_embedding_path: str | None = None):
+        super().__init__()
+        models = setup_models(device, vncorenlp_path)
+        self.vncore = models["vncore"]
+        self.resnet = models["resnet"]
+        self.roberta = models["roberta"]
+        self.tokenizer = models["tokenizer"]
+        self.preprocess = models["preprocess"]
+        self.device = device
+        if wiki_embedding_path:
+            self.entity_embedder = NamedEntityEmbedder(wiki_embedding_path)
+            self.entity_dim = self.entity_embedder.dim
+        else:
+            self.entity_embedder = None
+            self.entity_dim = 300
+
+    def forward(self, image: Image.Image, article_text: str):
+        img_feat = image_feature(image, self.resnet, self.preprocess, self.device)
+        txt_feat = mstr_embed(article_text, self.tokenizer, self.roberta,
+                              self.vncore, self.device)
+        ents = extract_entities(article_text, self.vncore)
+        ent_list = []
+        for v in ents.values():
+            ent_list.extend(v)
+        if self.entity_embedder:
+            ent_feat = self.entity_embedder(ent_list).to(self.device)
+        else:
+            ent_feat = torch.zeros((0, self.entity_dim), device=self.device)
+        return {
+            "image": torch.tensor(img_feat, device=self.device),
+            "image_mask": None,
+            "text": torch.tensor(txt_feat, device=self.device).unsqueeze(0),
+            "text_mask": None,
+            "entities": ent_feat,
+            "entity_mask": None,
+        }
 
 def setup_models(device: torch.device, vncorenlp_path="/data/npl/ICEK/VnCoreNLP"):
     py_vncorenlp.download_model(save_dir=vncorenlp_path)
